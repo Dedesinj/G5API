@@ -565,17 +565,47 @@ class ServerRcon {
   }
 
   /**
+   * Extracts the backup file name from a line of `get5_listbackups`.
+   *
+   * get5 and MatchZy list each backup as its file name followed by details
+   * (date, teams, map, score), e.g.
+   * `matchzy_917_1_round01.json 2026-11-27 22:30:26 Team A Team B de_vertigo 0 1`,
+   * while `get5_loadbackup` only accepts the file name. Only plain file names
+   * are accepted, which also keeps anything else out of the RCON command.
+   * @param {string} entry - A listed backup line or a bare file name.
+   * @returns The file name, or null if the entry holds none.
+   */
+  static parseBackupName(entry: string): string | null {
+    const first: string = String(entry ?? "").trim().split(/\s+/)[0] ?? "";
+    return /^[\w.\-]+\.(json|cfg)$/i.test(first) ? first : null;
+  }
+
+  /**
+   * Parses the output of `get5_listbackups` into file names and their details.
+   * @param {string} raw - The RCON response.
+   */
+  static parseBackupList(raw: string): { file: string; label: string }[] {
+    return String(raw ?? "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .map((line) => ({ file: ServerRcon.parseBackupName(line), label: line }))
+      .filter((entry): entry is { file: string; label: string } => entry.file !== null);
+  }
+
+  /**
    * Attempts to restore a given backup on the server
    * @function
-   * @param {String} backupName - The filename of the backup on the server.
+   * @param {String} backupName - The filename of the backup on the server, or a listed backup line.
    * @returns Returns the response from the server.
    */
   async restoreBackup(backupName: string): Promise<string> {
+    const fileName: string | null = ServerRcon.parseBackupName(backupName);
+    if (!fileName) throw new Error(`Invalid backup name: ${backupName}`);
     try {
       if (process.env.NODE_ENV === "test") {
         return "Cannot restore backups on a test instance. Please use a development or production environment.";
       }
-      let loadMatchResponse = await this.execute(`get5_loadbackup ${backupName}`);
+      let loadMatchResponse = await this.execute(`get5_loadbackup ${fileName}`);
       return loadMatchResponse;
     } catch (err) {
       console.error("RCON error on restore backup: " + (err as Error).toString());

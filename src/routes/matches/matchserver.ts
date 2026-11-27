@@ -1032,7 +1032,11 @@ router.get(
         let serverUpdate: GameServer = await getGameServer(req.params.match_id);
         try {
           let rconResponse: string = await serverUpdate.getBackups();
-          res.json({ message: "Backups retrieved.", response: rconResponse });
+          res.json({
+            message: "Backups retrieved.",
+            response: rconResponse,
+            backups: GameServer.parseBackupList(rconResponse)
+          });
         } catch (err) {
           res
             .status(500)
@@ -1112,6 +1116,10 @@ router.post(
           res
             .status(412)
             .json({ message: "Please provide the backup name." });
+          return;
+        }
+        if (!GameServer.parseBackupName(req.body[0].backup_name)) {
+          res.status(412).json({ message: "Invalid backup name." });
           return;
         }
         try {
