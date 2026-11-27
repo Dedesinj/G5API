@@ -2,9 +2,9 @@
  * Discord integration of seasons, through up to three webhooks per season:
  *
  * - launch: a match is posted when it is created, edited when its server
- *   changes, and deleted as soon as it goes live (first score).
- * - live: a match is posted when it goes live, edited on every score update,
- *   and deleted when it ends, is cancelled, forfeited or deleted.
+ *   changes, and deleted as soon as it is launched (veto, map loaded, score).
+ * - live: a match is posted when it is launched, edited on every veto step
+ *   and score update, and deleted when it ends, is cancelled, forfeited or deleted.
  * - results: the final score of a finished match is posted once.
  *
  * Every exported function swallows its errors: Discord must never break the
@@ -188,6 +188,13 @@ async function loadMaps(matchId: number | string): Promise<RowDataPacket[]> {
   );
 }
 
+async function loadVetoes(matchId: number | string): Promise<RowDataPacket[]> {
+  return db.query(
+    "SELECT team_name, map, pick_or_veto FROM veto WHERE match_id = ? ORDER BY id ASC",
+    [matchId]
+  );
+}
+
 /** Returns the match title to display, or undefined if it is only a get5 template.
  *
  * Matches created without a title get the get5 default "Map {MAPNUMBER} of {MAXMAPS}",
@@ -257,7 +264,7 @@ function buildLaunchMessage(match: MatchRow): object {
   });
 }
 
-function buildLiveMessage(match: MatchRow, maps: RowDataPacket[]): object {
+function buildLiveMessage(match: MatchRow, maps: RowDataPacket[], vetoes: RowDataPacket[] = []): object {
   const { team1, team2 } = teamNames(match);
   const lines: string[] = [];
   const title: string | undefined = displayTitle(match.title);
@@ -267,7 +274,20 @@ function buildLiveMessage(match: MatchRow, maps: RowDataPacket[]): object {
   }
   const maplist: string = mapLines(match, maps, false);
   if (maplist) lines.push(maplist);
-  else lines.push("Warmup / veto in progress");
+  else if (vetoes.length) {
+    lines.push("**Veto in progress**");
+    lines.push(
+      vetoes
+        .map((v) =>
+          v.team_name === "Decider"
+            ? `🎯 Decider: ${v.map}`
+            : v.pick_or_veto === "pick"
+            ? `✅ ${v.team_name} picks ${v.map}`
+            : `❌ ${v.team_name} bans ${v.map}`
+        )
+        .join("\n")
+    );
+  } else lines.push("Warmup / veto in progress");
   const fields: object[] = [];
   if (match.ip_string) {
     fields.push({ name: "Server", value: `\`\`\`connect ${match.ip_string}:${match.port}\`\`\``, inline: false });
@@ -368,7 +388,9 @@ export function removeMatchAnnouncement(matchId: number | string): Promise<void>
 
 /* Live channel */
 
-/** Posts or updates the live score of a match. Several calls in a row are coalesced. Never throws. */
+/** Posts or updates the live state of a match, and drops it from the launch
+ * channel: anything live (veto, warmup, map change, score) means the match
+ * was launched. Several calls in a row are coalesced. Never throws. */
 export function updateLiveMatch(matchId: number | string): Promise<void> {
   const key: string = String(matchId);
   if (pendingLive.has(key)) return queues.get(key) ?? Promise.resolve();
@@ -378,9 +400,10 @@ export function updateLiveMatch(matchId: number | string): Promise<void> {
     const match = await loadMatch(matchId);
     // A late round event must not bring back a match that already ended.
     if (!match || isFinished(match)) return;
+    await removeLaunchMessage(match);
     const webhookUrl = await getSeasonWebhook(match.season_id, "live");
     if (!webhookUrl) return;
-    const message = buildLiveMessage(match, await loadMaps(matchId));
+    const message = buildLiveMessage(match, await loadMaps(matchId), await loadVetoes(matchId));
     if (match.discord_live_message_id) {
       try {
         await callWebhook(webhookUrl, "PATCH", `/messages/${match.discord_live_message_id}`, message);
@@ -397,9 +420,9 @@ export function updateLiveMatch(matchId: number | string): Promise<void> {
   });
 }
 
-/** A match goes live: drop it from the launch channel and show it in the live channel. Never throws. */
+/** A match goes live (veto started, map loaded, first score): moves it from
+ * the launch channel to the live channel. Never throws. */
 export function matchWentLive(matchId: number | string): Promise<void> {
-  removeMatchAnnouncement(matchId);
   return updateLiveMatch(matchId);
 }
 

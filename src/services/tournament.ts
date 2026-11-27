@@ -16,7 +16,7 @@ import { update_toornament_match, TournamentEvent } from "./toornament.js";
 export type { TournamentEvent };
 
 /** Reports a match event to the bracket of its season, if any. Never throws.
- * @param {TournamentEvent} event - `live` (round score), `map_end` or `series_end`.
+ * @param {TournamentEvent} event - `veto` (maps known), `live` (round score), `map_end` or `series_end`.
  * @param {number | string} match_id - The internal match ID.
  * @param {number} season_id - The internal season ID.
  * @param {number} team1_id - The internal ID of the first team.
@@ -42,15 +42,41 @@ export default async function update_tournament_match(
     if (!season[0]) return;
 
     if (season[0].is_toornament) {
-      await update_toornament_match(event, match_id, season_id, winner);
+      const report = update_toornament_match(event, match_id, season_id, winner);
+      // Round and veto updates must not delay the answer to the game server.
+      if (event !== "live" && event !== "veto") await report;
       return;
     }
 
-    // Challonge gets the live round score of a BO1, and the series score after each map otherwise.
+    // Challonge has no maps to set, gets the live round score of a BO1, and the series score after each map otherwise.
+    if (event === "veto") return;
     if (event === "live" && num_maps != 1) return;
     if (event === "map_end" && num_maps == 1) return;
     await update_challonge_match(match_id, season_id, team1_id, team2_id, num_maps, winner);
   } catch (err) {
     console.error(`Failed to update tournament match ${match_id}: ${err}`);
+  }
+}
+
+/** Reports the maps known so far (veto picks, imposed maps) to the bracket of a match. Never throws.
+ * @param {number | string} match_id - The internal match ID.
+ */
+export async function report_tournament_maps(match_id: number | string): Promise<void> {
+  try {
+    const rows: RowDataPacket[] = await db.query(
+      "SELECT season_id, team1_id, team2_id, max_maps FROM `match` WHERE id = ?",
+      [match_id]
+    );
+    if (!rows[0]?.season_id) return;
+    await update_tournament_match(
+      "veto",
+      match_id,
+      rows[0].season_id,
+      rows[0].team1_id,
+      rows[0].team2_id,
+      rows[0].max_maps
+    );
+  } catch (err) {
+    console.error(`Failed to report the maps of match ${match_id}: ${err}`);
   }
 }

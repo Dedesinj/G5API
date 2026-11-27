@@ -40,6 +40,7 @@ import {
   finishMatch,
   refreshMatchAnnouncement
 } from "../../services/discord.js";
+import { report_tournament_maps } from "../../services/tournament.js";
 
 type MatchGame = "cs2" | "csgo";
 const DEFAULT_MATCH_GAME: MatchGame = "cs2";
@@ -1442,6 +1443,8 @@ router.post("/", Utils.ensureAuthenticated, async (req, res, next) => {
     if (req.body[0].season_id) invalidateSeasonBoard(+req.body[0].season_id);
     // Not awaited: Discord must not slow down match creation.
     announceMatch(insertMatch.insertId);
+    // Imposed maps are known right away: show them on the bracket.
+    if (toornamentMatchId) report_tournament_maps(insertMatch.insertId);
     res.json({
       message: "Match inserted successfully!",
       id: insertMatch.insertId

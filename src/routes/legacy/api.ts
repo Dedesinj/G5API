@@ -112,7 +112,7 @@ const playerStatRateLimit = rateLimit({
 /** Challonge / Toornament API integration.
  * @const
  */
-import update_tournament_match from "../../services/tournament.js";
+import update_tournament_match, { report_tournament_maps } from "../../services/tournament.js";
 import { finishMatch, matchWentLive, updateLiveMatch } from "../../services/discord.js";
 import Utils from "../../utility/utils.js";
 import { Request, ParamsDictionary } from "express-serve-static-core";
@@ -864,6 +864,8 @@ router.post("/:match_id/vetoUpdate", basicRateLimit, async (req, res, next) => {
     insertSql = "INSERT INTO veto SET ?";
     await db.query(insertSql, [insertStmt]);
     GlobalEmitter.emit("vetoUpdate");
+    matchWentLive(matchID!);
+    report_tournament_maps(matchID!);
     res.status(200).send({ message: "Success" });
   } catch (err) {
     res.status(500).json({ message: (err as Error).toString() });
@@ -984,6 +986,7 @@ router.post("/:match_id/vetoSideUpdate", basicRateLimit, async (req, res, next) 
     insertSql = "INSERT INTO veto_side SET ?";
     await db.query(insertSql, [insertStmt]);
     GlobalEmitter.emit("vetoSideUpdate");
+    matchWentLive(matchID!);
     res.status(200).send({ message: "Success" });
   } catch (err) {
     res.status(500).json({ message: (err as Error).toString() });
