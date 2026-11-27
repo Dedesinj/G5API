@@ -9,7 +9,7 @@ const router = Router();
 
 import { db } from "../../services/db.js";
 import { releaseManagedServer } from "../../services/dathost.js";
-import { removeMatchAnnouncement } from "../../services/discord.js";
+import { finishMatch } from "../../services/discord.js";
 import Utils from "../../utility/utils.js";
 
 import GameServer from "../../utility/serverrcon.js";
@@ -151,7 +151,7 @@ router.get(
           }
         }
         await releaseManagedServer(matchRow[0].server_id);
-        await removeMatchAnnouncement(req.params.match_id);
+        await finishMatch(req.params.match_id);
         GlobalEmitter.emit("matchUpdate");
         res.json({ message: "Match has been forfeitted successfully." });
         return;
@@ -276,7 +276,7 @@ router.get(
           }
         }
         await releaseManagedServer(matchRow[0].server_id);
-        await removeMatchAnnouncement(req.params.match_id);
+        await finishMatch(req.params.match_id);
         GlobalEmitter.emit("matchUpdate");
         res.json({ message: "Match has been cancelled successfully." });
         return;

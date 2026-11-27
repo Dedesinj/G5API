@@ -1,10 +1,14 @@
 /**
- * Announces the matches of a season in a Discord channel through a webhook.
+ * Discord integration of seasons, through up to three webhooks per season:
  *
- * A message is posted when a match is created, edited when its server
- * changes, and deleted as soon as the match goes live (first score), or when
- * it is cancelled, forfeited or deleted. Every function here swallows its
- * errors: Discord must never break the match flow.
+ * - launch: a match is posted when it is created, edited when its server
+ *   changes, and deleted as soon as it goes live (first score).
+ * - live: a match is posted when it goes live, edited on every score update,
+ *   and deleted when it ends, is cancelled, forfeited or deleted.
+ * - results: the final score of a finished match is posted once.
+ *
+ * Every exported function swallows its errors: Discord must never break the
+ * match flow.
  *
  * @module services/discord
  */
@@ -18,9 +22,25 @@ import Utils from "../utility/utils.js";
 
 const WEBHOOK_PATTERN =
   /^https:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/api(?:\/v\d+)?\/webhooks\/(\d+)\/([\w-]+)\/?$/i;
-const EMBED_COLOR = 0x2196f3;
 /** Name displayed as the author of every message, overriding the webhook's own name. */
 const BOT_NAME = "eBot";
+const COLORS = { launch: 0x2196f3, live: 0xe53935, results: 0x43a047, draw: 0x9e9e9e };
+
+export type DiscordChannel = "launch" | "live" | "results";
+
+/** Season column holding the encrypted webhook URL of each channel. */
+export const CHANNEL_COLUMNS: Record<DiscordChannel, string> = {
+  launch: "discord_webhook_url",
+  live: "discord_live_webhook_url",
+  results: "discord_results_webhook_url"
+};
+export const CHANNELS: DiscordChannel[] = ["launch", "live", "results"];
+
+const TEST_MESSAGES: Record<DiscordChannel, string> = {
+  launch: "Matches to launch will be posted here, with the connect command of their server.",
+  live: "Live matches will be posted here and updated with every score change.",
+  results: "Final scores of finished matches will be posted here."
+};
 
 /** Thrown for invalid webhook URLs or failed Discord calls. Never carries the token. */
 export class DiscordError extends Error {
@@ -28,6 +48,10 @@ export class DiscordError extends Error {
     super(message);
     this.name = "DiscordError";
   }
+}
+
+export function isDiscordChannel(value: unknown): value is DiscordChannel {
+  return CHANNELS.includes(value as DiscordChannel);
 }
 
 /** Normalizes a webhook URL, or throws if it is not a Discord webhook. */
@@ -63,14 +87,24 @@ async function callWebhook(
   return text ? JSON.parse(text) : null;
 }
 
-/** Returns the decrypted webhook URL of a season, if one is configured. */
-async function getSeasonWebhook(seasonId: number | null | undefined): Promise<string | null> {
+/** Deletes a message, ignoring messages already deleted by hand. */
+async function deleteMessage(webhookUrl: string, messageId: string): Promise<void> {
+  await callWebhook(webhookUrl, "DELETE", `/messages/${messageId}`).catch((err) => {
+    if (!(err instanceof DiscordError && err.status === 404)) throw err;
+  });
+}
+
+/** Returns the decrypted webhook URL of a season channel, if one is configured. */
+async function getSeasonWebhook(
+  seasonId: number | null | undefined,
+  channel: DiscordChannel
+): Promise<string | null> {
   if (!seasonId) return null;
   const rows: RowDataPacket[] = await db.query(
-    "SELECT discord_webhook_url FROM season WHERE id = ?",
+    `SELECT ${CHANNEL_COLUMNS[channel]} AS url FROM season WHERE id = ?`,
     [seasonId]
   );
-  const encrypted = rows[0]?.discord_webhook_url;
+  const encrypted = rows[0]?.url;
   return encrypted ? Utils.decrypt(encrypted) || null : null;
 }
 
@@ -89,10 +123,75 @@ export async function describeWebhook(
   }
 }
 
+/* Per-match queue: score events arrive every round and may overlap, so every
+ * Discord update of a match runs one after the other. */
+const queues: Map<string, Promise<void>> = new Map();
+const pendingLive: Set<string> = new Set();
+
+function enqueue(matchId: number | string, task: () => Promise<void>): Promise<void> {
+  const key: string = String(matchId);
+  const next: Promise<void> = (queues.get(key) ?? Promise.resolve())
+    .then(task)
+    .catch((err) => console.error(`Discord update of match ${key} failed: ${err}`));
+  queues.set(key, next);
+  next.then(() => {
+    if (queues.get(key) === next) queues.delete(key);
+  });
+  return next;
+}
+
+/* Message builders */
+
+interface MatchRow extends RowDataPacket {
+  id: number;
+  title: string | null;
+  max_maps: number | null;
+  skip_veto: number | null;
+  veto_mappool: string | null;
+  team1_id: number;
+  team2_id: number;
+  team1_string: string | null;
+  team2_string: string | null;
+  team1_score: number | null;
+  team2_score: number | null;
+  winner: number | null;
+  cancelled: number | null;
+  forfeit: number | null;
+  end_time: Date | null;
+  season_id: number | null;
+  season_name: string | null;
+  ip_string: string | null;
+  port: number | null;
+  discord_message_id: string | null;
+  discord_live_message_id: string | null;
+  discord_result_message_id: string | null;
+}
+
+async function loadMatch(matchId: number | string): Promise<MatchRow | null> {
+  const rows = (await db.query(
+    "SELECT m.id, m.title, m.max_maps, m.skip_veto, m.veto_mappool, m.team1_id, m.team2_id, " +
+      "m.team1_string, m.team2_string, m.team1_score, m.team2_score, m.winner, m.cancelled, m.forfeit, " +
+      "m.end_time, m.season_id, m.discord_message_id, m.discord_live_message_id, m.discord_result_message_id, " +
+      "s.name AS season_name, g.ip_string, g.port " +
+      "FROM `match` m LEFT JOIN season s ON s.id = m.season_id " +
+      "LEFT JOIN game_server g ON g.id = m.server_id WHERE m.id = ?",
+    [matchId]
+  )) as MatchRow[];
+  return rows[0] ?? null;
+}
+
+async function loadMaps(matchId: number | string): Promise<RowDataPacket[]> {
+  return db.query(
+    "SELECT map_number, map_name, team1_score, team2_score, winner, end_time FROM map_stats " +
+      "WHERE match_id = ? ORDER BY map_number ASC",
+    [matchId]
+  );
+}
+
 /** Returns the match title to display, or undefined if it is only a get5 template.
  *
  * Matches created without a title get the get5 default "Map {MAPNUMBER} of {MAXMAPS}",
- * whose placeholders are filled in game per map and mean nothing before the match.
+ * whose placeholders are filled in game per map and mean nothing outside the game.
  */
 function displayTitle(title: string | null | undefined): string | undefined {
   const value: string = String(title ?? "").trim();
@@ -100,23 +199,45 @@ function displayTitle(title: string | null | undefined): string | undefined {
   return value;
 }
 
-/** Builds the announcement of a match. */
-async function buildMessage(matchId: number): Promise<object | null> {
-  const rows: RowDataPacket[] = await db.query(
-    "SELECT m.id, m.title, m.max_maps, m.skip_veto, m.veto_mappool, m.team1_string, m.team2_string, " +
-      "s.name AS season_name, g.ip_string, g.port " +
-      "FROM `match` m LEFT JOIN season s ON s.id = m.season_id " +
-      "LEFT JOIN game_server g ON g.id = m.server_id WHERE m.id = ?",
-    [matchId]
-  );
-  const match = rows[0];
-  if (!match) return null;
+function teamNames(match: MatchRow): { team1: string; team2: string } {
+  return { team1: match.team1_string || "Team 1", team2: match.team2_string || "Team 2" };
+}
 
-  const team1: string = match.team1_string || "Team 1";
-  const team2: string = match.team2_string || "Team 2";
-  const fields: object[] = [
-    { name: "Format", value: `BO${match.max_maps ?? 1}`, inline: true }
-  ];
+/** Common embed parts: link to the match page and season footer. */
+function baseEmbed(match: MatchRow, color: number): Record<string, any> {
+  const clientHome: string = config.has("server.clientHome")
+    ? String(config.get("server.clientHome")).replace(/\/$/, "")
+    : "";
+  const embed: Record<string, any> = {
+    color,
+    footer: {
+      text: match.season_name ? `${match.season_name} · Match #${match.id}` : `Match #${match.id}`
+    },
+    timestamp: new Date().toISOString()
+  };
+  if (/^https?:\/\//.test(clientHome)) embed.url = `${clientHome}/match/${match.id}`;
+  return embed;
+}
+
+function wrap(embed: Record<string, any>): object {
+  return { username: BOT_NAME, embeds: [embed], allowed_mentions: { parse: [] } };
+}
+
+/** One line per map, e.g. "✅ de_nuke — **13 - 7**". */
+function mapLines(match: MatchRow, maps: RowDataPacket[], finished: boolean): string {
+  return maps
+    .map((map) => {
+      const name: string = map.map_name || `Map ${map.map_number + 1}`;
+      const done: boolean = finished || Boolean(map.end_time) || map.winner != null;
+      const icon: string = done ? "✅" : "▶️";
+      return `${icon} ${name} — **${map.team1_score ?? 0} - ${map.team2_score ?? 0}**`;
+    })
+    .join("\n");
+}
+
+function buildLaunchMessage(match: MatchRow): object {
+  const { team1, team2 } = teamNames(match);
+  const fields: object[] = [{ name: "Format", value: `BO${match.max_maps ?? 1}`, inline: true }];
   if (match.skip_veto && match.veto_mappool) {
     const maps: string[] = String(match.veto_mappool).split(" ").filter(Boolean);
     fields.push({ name: "Maps", value: maps.slice(0, match.max_maps || 1).join(", "), inline: true });
@@ -125,101 +246,210 @@ async function buildMessage(matchId: number): Promise<object | null> {
   }
   fields.push({
     name: "Server",
-    value: match.ip_string
-      ? `\`\`\`connect ${match.ip_string}:${match.port}\`\`\``
-      : "Not assigned yet",
+    value: match.ip_string ? `\`\`\`connect ${match.ip_string}:${match.port}\`\`\`` : "Not assigned yet",
     inline: false
   });
-
-  const clientHome: string = config.has("server.clientHome")
-    ? String(config.get("server.clientHome")).replace(/\/$/, "")
-    : "";
-  const embed: Record<string, any> = {
+  return wrap({
+    ...baseEmbed(match, COLORS.launch),
     title: `${team1} vs ${team2}`,
     description: displayTitle(match.title),
-    color: EMBED_COLOR,
-    fields,
-    footer: { text: match.season_name ? `${match.season_name} · Match #${match.id}` : `Match #${match.id}` },
-    timestamp: new Date().toISOString()
-  };
-  if (/^https?:\/\//.test(clientHome)) embed.url = `${clientHome}/match/${match.id}`;
-  return {
-    username: BOT_NAME,
-    embeds: [embed],
-    allowed_mentions: { parse: [] }
-  };
+    fields
+  });
 }
 
+function buildLiveMessage(match: MatchRow, maps: RowDataPacket[]): object {
+  const { team1, team2 } = teamNames(match);
+  const lines: string[] = [];
+  const title: string | undefined = displayTitle(match.title);
+  if (title) lines.push(title);
+  if ((match.max_maps ?? 1) > 1) {
+    lines.push(`Series: **${match.team1_score ?? 0} - ${match.team2_score ?? 0}** (BO${match.max_maps})`);
+  }
+  const maplist: string = mapLines(match, maps, false);
+  if (maplist) lines.push(maplist);
+  else lines.push("Warmup / veto in progress");
+  const fields: object[] = [];
+  if (match.ip_string) {
+    fields.push({ name: "Server", value: `\`\`\`connect ${match.ip_string}:${match.port}\`\`\``, inline: false });
+  }
+  return wrap({
+    ...baseEmbed(match, COLORS.live),
+    author: { name: "🔴 LIVE" },
+    title: `${team1} vs ${team2}`,
+    description: lines.join("\n"),
+    fields
+  });
+}
+
+function buildResultMessage(match: MatchRow, maps: RowDataPacket[]): object {
+  const { team1, team2 } = teamNames(match);
+  // A BO1 is best summed up by its round score, a series by the maps won.
+  const singleMap: boolean = (match.max_maps ?? 1) == 1 && maps.length === 1;
+  const score1: number = (singleMap ? maps[0].team1_score : match.team1_score) ?? 0;
+  const score2: number = (singleMap ? maps[0].team2_score : match.team2_score) ?? 0;
+  let headline: string;
+  let color: number = COLORS.results;
+  if (match.winner != null && match.winner == match.team1_id) {
+    headline = `🏆 **${team1}** wins${match.forfeit ? " by forfeit" : ""}`;
+  } else if (match.winner != null && match.winner == match.team2_id) {
+    headline = `🏆 **${team2}** wins${match.forfeit ? " by forfeit" : ""}`;
+  } else {
+    headline = "🤝 Draw";
+    color = COLORS.draw;
+  }
+  const lines: string[] = [headline];
+  const title: string | undefined = displayTitle(match.title);
+  if (title) lines.push(title);
+  if (!singleMap) {
+    const maplist: string = mapLines(match, maps, true);
+    if (maplist) lines.push(maplist);
+  } else if (maps[0]?.map_name) {
+    lines.push(`Map: ${maps[0].map_name}`);
+  }
+  return wrap({
+    ...baseEmbed(match, color),
+    title: `${team1}  ${score1} - ${score2}  ${team2}`,
+    description: lines.join("\n")
+  });
+}
+
+function isFinished(match: MatchRow): boolean {
+  return match.cancelled == 1 || match.end_time != null;
+}
+
+/* Launch channel */
+
 /** Posts the announcement of a newly created match to its season channel. Never throws. */
-export async function announceMatch(matchId: number): Promise<void> {
-  try {
-    const rows: RowDataPacket[] = await db.query(
-      "SELECT season_id, discord_message_id FROM `match` WHERE id = ?",
-      [matchId]
-    );
-    if (!rows[0] || rows[0].discord_message_id) return;
-    const webhookUrl = await getSeasonWebhook(rows[0].season_id);
+export function announceMatch(matchId: number): Promise<void> {
+  return enqueue(matchId, async () => {
+    const match = await loadMatch(matchId);
+    if (!match || match.discord_message_id || isFinished(match)) return;
+    const webhookUrl = await getSeasonWebhook(match.season_id, "launch");
     if (!webhookUrl) return;
-    const message = await buildMessage(matchId);
-    if (!message) return;
-    const posted = await callWebhook(webhookUrl, "POST", "?wait=true", message);
+    const posted = await callWebhook(webhookUrl, "POST", "?wait=true", buildLaunchMessage(match));
     if (posted?.id) {
       await db.query("UPDATE `match` SET discord_message_id = ? WHERE id = ?", [posted.id, matchId]);
     }
-  } catch (err) {
-    console.error(`Failed to announce match ${matchId} on Discord: ${err}`);
-  }
+  });
 }
 
 /** Refreshes the announcement of a match (e.g. after a server change). Never throws. */
-export async function refreshMatchAnnouncement(matchId: number): Promise<void> {
-  try {
-    const rows: RowDataPacket[] = await db.query(
-      "SELECT season_id, discord_message_id FROM `match` WHERE id = ?",
-      [matchId]
-    );
-    if (!rows[0]?.discord_message_id) return;
-    const webhookUrl = await getSeasonWebhook(rows[0].season_id);
+export function refreshMatchAnnouncement(matchId: number): Promise<void> {
+  return enqueue(matchId, async () => {
+    const match = await loadMatch(matchId);
+    if (!match?.discord_message_id) return;
+    const webhookUrl = await getSeasonWebhook(match.season_id, "launch");
     if (!webhookUrl) return;
-    const message = await buildMessage(matchId);
-    if (!message) return;
-    await callWebhook(webhookUrl, "PATCH", `/messages/${rows[0].discord_message_id}`, message);
-  } catch (err) {
-    console.error(`Failed to update the Discord announcement of match ${matchId}: ${err}`);
-  }
+    await callWebhook(webhookUrl, "PATCH", `/messages/${match.discord_message_id}`, buildLaunchMessage(match));
+  });
 }
 
-/** Removes the announcement of a match, if it still exists. Idempotent, never throws. */
-export async function removeMatchAnnouncement(matchId: number | string): Promise<void> {
-  try {
-    const rows: RowDataPacket[] = await db.query(
-      "SELECT season_id, discord_message_id FROM `match` WHERE id = ?",
-      [matchId]
-    );
-    const messageId: string | null = rows[0]?.discord_message_id ?? null;
-    if (!messageId) return;
-    // Claim the message first so concurrent events (every round end) delete it once.
-    const claim: any = await db.query(
-      "UPDATE `match` SET discord_message_id = NULL WHERE id = ? AND discord_message_id = ?",
-      [matchId, messageId]
-    );
-    if (!claim?.affectedRows) return;
-    const webhookUrl = await getSeasonWebhook(rows[0].season_id);
-    if (!webhookUrl) return;
-    await callWebhook(webhookUrl, "DELETE", `/messages/${messageId}`).catch((err) => {
-      // Already deleted by hand in Discord: nothing to do.
-      if (!(err instanceof DiscordError && err.status === 404)) throw err;
-    });
-  } catch (err) {
-    console.error(`Failed to remove the Discord announcement of match ${matchId}: ${err}`);
-  }
+async function removeLaunchMessage(match: MatchRow): Promise<void> {
+  if (!match.discord_message_id) return;
+  await db.query("UPDATE `match` SET discord_message_id = NULL WHERE id = ?", [match.id]);
+  const webhookUrl = await getSeasonWebhook(match.season_id, "launch");
+  if (webhookUrl) await deleteMessage(webhookUrl, match.discord_message_id);
 }
+
+async function removeLiveMessage(match: MatchRow): Promise<void> {
+  if (!match.discord_live_message_id) return;
+  await db.query("UPDATE `match` SET discord_live_message_id = NULL WHERE id = ?", [match.id]);
+  const webhookUrl = await getSeasonWebhook(match.season_id, "live");
+  if (webhookUrl) await deleteMessage(webhookUrl, match.discord_live_message_id);
+}
+
+/** Removes the "to launch" announcement of a match, if it still exists. Idempotent, never throws. */
+export function removeMatchAnnouncement(matchId: number | string): Promise<void> {
+  return enqueue(matchId, async () => {
+    const match = await loadMatch(matchId);
+    if (match) await removeLaunchMessage(match);
+  });
+}
+
+/* Live channel */
+
+/** Posts or updates the live score of a match. Several calls in a row are coalesced. Never throws. */
+export function updateLiveMatch(matchId: number | string): Promise<void> {
+  const key: string = String(matchId);
+  if (pendingLive.has(key)) return queues.get(key) ?? Promise.resolve();
+  pendingLive.add(key);
+  return enqueue(matchId, async () => {
+    pendingLive.delete(key);
+    const match = await loadMatch(matchId);
+    // A late round event must not bring back a match that already ended.
+    if (!match || isFinished(match)) return;
+    const webhookUrl = await getSeasonWebhook(match.season_id, "live");
+    if (!webhookUrl) return;
+    const message = buildLiveMessage(match, await loadMaps(matchId));
+    if (match.discord_live_message_id) {
+      try {
+        await callWebhook(webhookUrl, "PATCH", `/messages/${match.discord_live_message_id}`, message);
+        return;
+      } catch (err) {
+        // Deleted by hand in Discord: post it again below.
+        if (!(err instanceof DiscordError && err.status === 404)) throw err;
+      }
+    }
+    const posted = await callWebhook(webhookUrl, "POST", "?wait=true", message);
+    if (posted?.id) {
+      await db.query("UPDATE `match` SET discord_live_message_id = ? WHERE id = ?", [posted.id, matchId]);
+    }
+  });
+}
+
+/** A match goes live: drop it from the launch channel and show it in the live channel. Never throws. */
+export function matchWentLive(matchId: number | string): Promise<void> {
+  removeMatchAnnouncement(matchId);
+  return updateLiveMatch(matchId);
+}
+
+/* End of match */
+
+/** A match ended (finished, forfeited or cancelled): clears its launch and live
+ * messages, and posts its final score in the results channel unless it was
+ * cancelled. Idempotent, never throws. */
+export function finishMatch(matchId: number | string): Promise<void> {
+  return enqueue(matchId, async () => {
+    const match = await loadMatch(matchId);
+    if (!match) return;
+    await removeLaunchMessage(match);
+    await removeLiveMessage(match);
+    if (match.cancelled == 1 || match.discord_result_message_id) return;
+    const webhookUrl = await getSeasonWebhook(match.season_id, "results");
+    if (!webhookUrl) return;
+    const posted = await callWebhook(
+      webhookUrl,
+      "POST",
+      "?wait=true",
+      buildResultMessage(match, await loadMaps(matchId))
+    );
+    if (posted?.id) {
+      await db.query("UPDATE `match` SET discord_result_message_id = ? WHERE id = ?", [posted.id, matchId]);
+    }
+  });
+}
+
+/** Clears the launch and live messages of a match without posting a result (e.g. before deleting it). Never throws. */
+export function clearMatchMessages(matchId: number | string): Promise<void> {
+  return enqueue(matchId, async () => {
+    const match = await loadMatch(matchId);
+    if (!match) return;
+    await removeLaunchMessage(match);
+    await removeLiveMessage(match);
+  });
+}
+
+/* Settings */
 
 /** Posts then deletes a short message, to check a webhook end to end. */
-export async function sendTestMessage(webhookUrl: string, seasonName: string): Promise<void> {
+export async function sendTestMessage(
+  webhookUrl: string,
+  seasonName: string,
+  channel: DiscordChannel = "launch"
+): Promise<void> {
   const posted = await callWebhook(webhookUrl, "POST", "?wait=true", {
     username: BOT_NAME,
-    content: `✅ ${BOT_NAME} is connected to this channel for the season **${seasonName}**. Matches to launch will be posted here.`,
+    content: `✅ ${BOT_NAME} is connected to this channel for the season **${seasonName}**. ${TEST_MESSAGES[channel]}`,
     allowed_mentions: { parse: [] }
   });
   if (posted?.id) {

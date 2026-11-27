@@ -36,8 +36,9 @@ import {
 } from "../../services/toornamentSeason.js";
 import {
   announceMatch,
-  refreshMatchAnnouncement,
-  removeMatchAnnouncement
+  clearMatchMessages,
+  finishMatch,
+  refreshMatchAnnouncement
 } from "../../services/discord.js";
 
 type MatchGame = "cs2" | "csgo";
@@ -1686,7 +1687,7 @@ router.put("/", Utils.ensureAuthenticated, async (req, res, next) => {
         }
       }
       if (req.body[0].cancelled == 1 || req.body[0].forfeit == 1 || req.body[0].end_time)
-        removeMatchAnnouncement(req.body[0].match_id);
+        finishMatch(req.body[0].match_id);
       else if (diffServer) refreshMatchAnnouncement(+req.body[0].match_id);
       res.json({ message: message });
       return;
@@ -1761,7 +1762,7 @@ router.delete("/", Utils.ensureAuthenticated, async (req, res, next) => {
           matchCancelledResult[0].end_time != null
         ) {
           let deleteMatchsql: string = "DELETE FROM `match` WHERE id = ?";
-          await removeMatchAnnouncement(matchId);
+          await clearMatchMessages(matchId);
           await db.query(playerStatDeleteSql, [matchId]);
           await db.query(mapStatDeleteSql, [matchId]);
           await db.query(spectatorDeleteSql, [matchId]);
