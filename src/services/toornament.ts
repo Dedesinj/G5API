@@ -532,8 +532,13 @@ async function reportToornamentMatch(
     [match_id]
   );
   const planned: string[] = await getPlannedMaps(match_id, maxMaps);
-  const resultFor = (winnerTeamId: number | null, teamId: number): ToornamentResult => {
-    if (!winnerTeamId) return null;
+  const resultFor = (
+    winnerTeamId: number | null,
+    teamId: number,
+    finished: boolean
+  ): ToornamentResult => {
+    // A map that ended with no winner is a draw (e.g. a BO1 tie).
+    if (!winnerTeamId) return finished ? "draw" : null;
     return winnerTeamId == teamId ? "win" : "loss";
   };
 
@@ -546,8 +551,8 @@ async function reportToornamentMatch(
     else if (map.winner == team2_id) team2Wins++;
     const finished: boolean = map.winner != null || map.end_time != null || event === "series_end";
     const opponents: ToornamentOpponentUpdate[] = [
-      { number: sides.team1, score: map.team1_score ?? 0, result: resultFor(map.winner, team1_id) },
-      { number: sides.team2, score: map.team2_score ?? 0, result: resultFor(map.winner, team2_id) }
+      { number: sides.team1, score: map.team1_score ?? 0, result: resultFor(map.winner, team1_id, finished) },
+      { number: sides.team2, score: map.team2_score ?? 0, result: resultFor(map.winner, team2_id, finished) }
     ];
     const mapName: string | null = map.map_name || planned[map.map_number] || null;
     const status = finished ? "completed" : "running";

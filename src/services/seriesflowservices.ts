@@ -37,7 +37,9 @@ class SeriesFlowService {
         event.winner?.team === "none" &&
         matchInfo[0].max_maps != 2 &&
         event.team1_series_score == 0 &&
-        event.team2_series_score == 0
+        event.team2_series_score == 0 &&
+        // Every map drawn (e.g. a BO1 ending in a tie) is a result, not a cancel.
+        !(await Utils.hasPlayedMap(event.matchid))
       ) {
         winnerId = null;
         cancelled = 1;
