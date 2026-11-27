@@ -89,6 +89,17 @@ export async function describeWebhook(
   }
 }
 
+/** Returns the match title to display, or undefined if it is only a get5 template.
+ *
+ * Matches created without a title get the get5 default "Map {MAPNUMBER} of {MAXMAPS}",
+ * whose placeholders are filled in game per map and mean nothing before the match.
+ */
+function displayTitle(title: string | null | undefined): string | undefined {
+  const value: string = String(title ?? "").trim();
+  if (!value || /\{[A-Z0-9_]+\}/.test(value)) return undefined;
+  return value;
+}
+
 /** Builds the announcement of a match. */
 async function buildMessage(matchId: number): Promise<object | null> {
   const rows: RowDataPacket[] = await db.query(
@@ -125,7 +136,7 @@ async function buildMessage(matchId: number): Promise<object | null> {
     : "";
   const embed: Record<string, any> = {
     title: `${team1} vs ${team2}`,
-    description: match.title || undefined,
+    description: displayTitle(match.title),
     color: EMBED_COLOR,
     fields,
     footer: { text: match.season_name ? `${match.season_name} · Match #${match.id}` : `Match #${match.id}` },
