@@ -19,6 +19,8 @@ import Utils from "../utility/utils.js";
 const WEBHOOK_PATTERN =
   /^https:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/api(?:\/v\d+)?\/webhooks\/(\d+)\/([\w-]+)\/?$/i;
 const EMBED_COLOR = 0x2196f3;
+/** Name displayed as the author of every message, overriding the webhook's own name. */
+const BOT_NAME = "eBot";
 
 /** Thrown for invalid webhook URLs or failed Discord calls. Never carries the token. */
 export class DiscordError extends Error {
@@ -131,7 +133,7 @@ async function buildMessage(matchId: number): Promise<object | null> {
   };
   if (/^https?:\/\//.test(clientHome)) embed.url = `${clientHome}/match/${match.id}`;
   return {
-    username: "G5",
+    username: BOT_NAME,
     embeds: [embed],
     allowed_mentions: { parse: [] }
   };
@@ -205,8 +207,8 @@ export async function removeMatchAnnouncement(matchId: number | string): Promise
 /** Posts then deletes a short message, to check a webhook end to end. */
 export async function sendTestMessage(webhookUrl: string, seasonName: string): Promise<void> {
   const posted = await callWebhook(webhookUrl, "POST", "?wait=true", {
-    username: "G5",
-    content: `✅ G5 is connected to this channel for the season **${seasonName}**. Matches to launch will be posted here.`,
+    username: BOT_NAME,
+    content: `✅ ${BOT_NAME} is connected to this channel for the season **${seasonName}**. Matches to launch will be posted here.`,
     allowed_mentions: { parse: [] }
   });
   if (posted?.id) {
