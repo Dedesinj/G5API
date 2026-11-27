@@ -11,6 +11,7 @@ import { RowDataPacket } from "mysql2";
 import { Response } from "express";
 import Utils from "../utility/utils.js";
 import update_tournament_match from "../services/tournament.js";
+import { removeMatchAnnouncement } from "../services/discord.js";
 
 class SeriesFlowService {
   static async OnSeriesResult(event: Get5_OnSeriesResult, res: Response) {
@@ -91,6 +92,7 @@ class SeriesFlowService {
       }
 
       // Check if a match has a season ID and we're not cancelled.
+      removeMatchAnnouncement(event.matchid);
       if (matchInfo[0].season_id && !cancelled) {
         await update_tournament_match(
           "series_end",

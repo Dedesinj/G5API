@@ -34,6 +34,11 @@ import {
   assertNoActiveG5Match,
   invalidateSeasonBoard
 } from "../../services/toornamentSeason.js";
+import {
+  announceMatch,
+  refreshMatchAnnouncement,
+  removeMatchAnnouncement
+} from "../../services/discord.js";
 
 type MatchGame = "cs2" | "csgo";
 const DEFAULT_MATCH_GAME: MatchGame = "cs2";
@@ -1434,6 +1439,8 @@ router.post("/", Utils.ensureAuthenticated, async (req, res, next) => {
       }
     }
     if (req.body[0].season_id) invalidateSeasonBoard(+req.body[0].season_id);
+    // Not awaited: Discord must not slow down match creation.
+    announceMatch(insertMatch.insertId);
     res.json({
       message: "Match inserted successfully!",
       id: insertMatch.insertId
@@ -1678,6 +1685,9 @@ router.put("/", Utils.ensureAuthenticated, async (req, res, next) => {
           await db.query(sql, [req.body[0].match_id, key, newCvars[key]]);
         }
       }
+      if (req.body[0].cancelled == 1 || req.body[0].forfeit == 1 || req.body[0].end_time)
+        removeMatchAnnouncement(req.body[0].match_id);
+      else if (diffServer) refreshMatchAnnouncement(+req.body[0].match_id);
       res.json({ message: message });
       return;
     }
@@ -1751,6 +1761,7 @@ router.delete("/", Utils.ensureAuthenticated, async (req, res, next) => {
           matchCancelledResult[0].end_time != null
         ) {
           let deleteMatchsql: string = "DELETE FROM `match` WHERE id = ?";
+          await removeMatchAnnouncement(matchId);
           await db.query(playerStatDeleteSql, [matchId]);
           await db.query(mapStatDeleteSql, [matchId]);
           await db.query(spectatorDeleteSql, [matchId]);

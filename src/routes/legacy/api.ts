@@ -113,6 +113,7 @@ const playerStatRateLimit = rateLimit({
  * @const
  */
 import update_tournament_match from "../../services/tournament.js";
+import { removeMatchAnnouncement } from "../../services/discord.js";
 import Utils from "../../utility/utils.js";
 import { Request, ParamsDictionary } from "express-serve-static-core";
 import { ParsedQs } from "qs";
@@ -291,6 +292,7 @@ router.post("/:match_id/finish", basicRateLimit, async (req, res, next) => {
       );
     }
     // Check if a match has a season ID and we're not cancelled.
+    removeMatchAnnouncement(matchID);
     if (matchValues[0].season_id && !cancelled) {
       await update_tournament_match(
         "series_end",
@@ -744,6 +746,7 @@ router.post(
           updateSql =
             "UPDATE map_stats SET ? WHERE match_id = ? AND map_number = ?";
           await db.query(updateSql, [updateStmt, matchID, mapNumber]);
+          removeMatchAnnouncement(matchID);
           if (matchValues[0].season_id != null) {
             // Live update the score.
             await update_tournament_match("live", matchID,

@@ -25,6 +25,7 @@ import { Get5_OnBombEvent } from "../types/map_flow/Get5_OnBombEvent.js";
 import { Get5_OnRoundEnd } from "../types/map_flow/Get5_OnRoundEnd.js";
 import { Get5_OnRoundStart } from "../types/map_flow/Get5_OnRoundStart.js";
 import update_tournament_match from "./tournament.js";
+import { removeMatchAnnouncement } from "./discord.js";
 
 /**
  * @class
@@ -301,6 +302,8 @@ class MapFlowService {
         team2_score: event.team2.score
       }
       await db.query(sqlString, [insUpdStatement, mapStatInfo[0].id]);
+      // The match is live: its "to launch" announcement is no longer needed.
+      removeMatchAnnouncement(event.matchid);
       // Live update the bracket provider if needed.
       sqlString = "SELECT max_maps, season_id FROM `match` WHERE id = ?";
       matchSeasonInfo = await db.query(sqlString, [event.matchid]);
