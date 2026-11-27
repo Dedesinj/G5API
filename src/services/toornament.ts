@@ -72,8 +72,19 @@ export function isCs2Discipline(discipline: string | null | undefined): boolean 
 /** Cached access tokens, keyed by client ID. Tokens live ~25h. */
 const tokenCache: Map<string, { token: string; expiresAt: number }> = new Map();
 
-/** Toornament match IDs resolved for internal matches, to avoid a lookup per event. */
-const matchIdCache: Map<string, string> = new Map();
+/** Toornament match resolved for an internal match, to avoid a lookup per round. */
+interface ResolvedMatch {
+  toornamentMatchId: string;
+  sides: { team1: number; team2: number };
+}
+const resolvedMatches: Map<string, ResolvedMatch> = new Map();
+
+/** Last payload sent per game / match, so unchanged data is never sent twice. */
+const sentPayloads: Map<string, string> = new Map();
+
+/** Per-match queue and pending live update, as round events arrive in bursts. */
+const reportQueues: Map<string, Promise<void>> = new Map();
+const pendingLiveReports: Set<string> = new Set();
 
 export class Toornament {
   constructor(private credentials: ToornamentCredentials) {
@@ -220,34 +231,41 @@ export class Toornament {
     });
   }
 
-  /** Updates the outcome of one game of a match.
+  /** Updates one game of a match: outcome, status and/or map.
    *
    * The `map` property only exists for disciplines that define it, so the game
-   * is retried without properties if Toornament rejects them.
+   * is retried without properties if Toornament rejects them. A game with no
+   * opponents and no status (a planned map only) is skipped in that case.
    * @param {string} matchId - The Toornament match ID.
    * @param {number} gameNumber - The game number, starting at 1.
-   * @param {ToornamentOpponentUpdate[]} opponents - One entry per side.
-   * @param {string | null} mapName - The map played, if known.
+   * @param {ToornamentOpponentUpdate[] | null} opponents - One entry per side, or null to leave the score untouched.
+   * @param {string | null} mapName - The map played or planned, if known.
+   * @param {string} [status] - `running` or `completed`; omitted to let Toornament decide.
    */
   async updateGame(
     matchId: string,
     gameNumber: number,
-    opponents: ToornamentOpponentUpdate[],
-    mapName: string | null
+    opponents: ToornamentOpponentUpdate[] | null,
+    mapName: string | null,
+    status?: "running" | "completed"
   ): Promise<void> {
     const path: string = `/matches/${encodeURIComponent(matchId)}/games/${gameNumber}`;
+    const body: Record<string, any> = {};
+    if (opponents) body.opponents = opponents;
+    if (status) body.status = status;
     if (mapName) {
       try {
         await this.request(path, {
           method: "PATCH",
-          body: JSON.stringify({ opponents, properties: { map: mapName } })
+          body: JSON.stringify({ ...body, properties: { map: mapName } })
         });
         return;
       } catch (err) {
         if (!(err instanceof ToornamentApiError) || err.status !== 400) throw err;
       }
     }
-    await this.request(path, { method: "PATCH", body: JSON.stringify({ opponents }) });
+    if (!Object.keys(body).length) return;
+    await this.request(path, { method: "PATCH", body: JSON.stringify(body) });
   }
 
   private async getToken(): Promise<string> {
@@ -340,151 +358,268 @@ export class Toornament {
   }
 }
 
-export type TournamentEvent = "live" | "map_end" | "series_end";
+export type TournamentEvent = "veto" | "live" | "map_end" | "series_end";
 
-/** Reports the state of a match to its Toornament bracket.
+/** Maps planned for each game of a match, in order, when they are known.
  *
- * Every played map is reported as a match game (score, result and map name)
- * and the match score is kept up to date. At the end of the series the match
- * results are set, which completes it on Toornament, and the season is closed
- * once no pending or running match remains. Never throws.
+ * Imposed maps come from the map pool of a match without veto. With an in-game
+ * veto they come from the picks so far, plus the decider once a single map of
+ * the pool is left.
+ */
+async function getPlannedMaps(matchId: number | string, maxMaps: number): Promise<string[]> {
+  const rows: RowDataPacket[] = await db.query(
+    "SELECT skip_veto, veto_mappool FROM `match` WHERE id = ?",
+    [matchId]
+  );
+  const pool: string[] = String(rows[0]?.veto_mappool ?? "")
+    .replace(/,/g, " ")
+    .split(" ")
+    .filter(Boolean);
+  if (rows[0]?.skip_veto) return pool.slice(0, maxMaps);
+
+  const vetoes: RowDataPacket[] = await db.query(
+    "SELECT map, pick_or_veto FROM veto WHERE match_id = ? ORDER BY id",
+    [matchId]
+  );
+  const picks: string[] = vetoes.filter((v) => v.pick_or_veto === "pick").map((v) => v.map);
+  const used: Set<string> = new Set(vetoes.map((v) => v.map));
+  const left: string[] = pool.filter((map) => !used.has(map));
+  if (picks.length === maxMaps - 1 && left.length === 1) picks.push(left[0]);
+  return picks.slice(0, maxMaps);
+}
+
+/** Sends a payload unless the exact same one was already sent. */
+async function sendOnce(key: string, payload: object, send: () => Promise<void>): Promise<void> {
+  const serialized: string = JSON.stringify(payload);
+  if (sentPayloads.get(key) === serialized) return;
+  await send();
+  sentPayloads.set(key, serialized);
+}
+
+/** Reports the state of a match to its Toornament bracket. Never throws.
+ *
+ * - every game played is reported with its score (live, round by round),
+ *   result, status and map; games still to play get their map once known;
+ * - the match score is kept up to date (round score for a BO1, maps won otherwise);
+ * - at the end of the series the match results are set, which completes it on
+ *   Toornament, and the season is closed once no pending or running match remains.
+ *
+ * Calls for a match run one after the other, live calls are coalesced, and data
+ * that did not change since the last call is not sent again.
  * @param {TournamentEvent} event - What triggered the update.
  * @param {number | string} match_id - The internal match ID.
  * @param {number} season_id - The internal season ID.
  * @param {string | null} [winner=null] - `team1`, `team2` or `none` at series end.
  */
-export async function update_toornament_match(
+export function update_toornament_match(
   event: TournamentEvent,
   match_id: number | string,
   season_id: number,
   winner: string | null = null
 ): Promise<void> {
-  // Live round updates would cost several API calls per round; only maps and series are reported.
-  if (event === "live") return;
-  try {
-    const seasonInfo: RowDataPacket[] = await db.query(
-      "SELECT id, user_id, toornament_id FROM season WHERE id = ? AND is_toornament = 1",
-      [season_id]
-    );
-    if (!seasonInfo[0]?.toornament_id) return;
-    const tournamentId: string = seasonInfo[0].toornament_id;
+  const key: string = String(match_id);
+  if (event === "live" || event === "veto") {
+    if (pendingLiveReports.has(key)) return reportQueues.get(key) ?? Promise.resolve();
+    pendingLiveReports.add(key);
+  }
+  const next: Promise<void> = (reportQueues.get(key) ?? Promise.resolve()).then(async () => {
+    if (event === "live" || event === "veto") pendingLiveReports.delete(key);
+    try {
+      await reportToornamentMatch(event, match_id, season_id, winner);
+    } catch (err) {
+      // Never let a bracket update take down the match flow that triggered it.
+      console.error(`Failed to update Toornament match for season ${season_id}: ${err}`);
+    }
+  });
+  reportQueues.set(key, next);
+  next.then(() => {
+    if (reportQueues.get(key) === next) reportQueues.delete(key);
+  });
+  return next;
+}
 
-    const matchInfo: RowDataPacket[] = await db.query(
-      "SELECT team1_id, team2_id, max_maps, toornament_match_id FROM `match` WHERE id = ?",
-      [match_id]
-    );
-    if (!matchInfo[0]) return;
-    const { team1_id, team2_id, max_maps } = matchInfo[0];
-
-    const teams: RowDataPacket[] = await db.query(
-      "SELECT id, toornament_team_id FROM team WHERE id IN (?, ?)",
-      [team1_id, team2_id]
-    );
-    const participantOf = (teamId: number): string | null => {
-      const row = teams.find((team) => team.id == teamId);
-      return row?.toornament_team_id ? String(row.toornament_team_id) : null;
-    };
-    const team1Participant: string | null = participantOf(team1_id);
-    const team2Participant: string | null = participantOf(team2_id);
-    if (!team1Participant || !team2Participant) return;
-
-    const toornament: Toornament = await Toornament.forUser(seasonInfo[0].user_id);
-
-    const cacheKey: string = String(match_id);
-    let toornamentMatchId: string | undefined = matchIdCache.get(cacheKey);
-    let target: ToornamentMatch | undefined;
-    if (matchInfo[0].toornament_match_id) {
-      // Matches created from the season page are linked explicitly.
-      target = await toornament.getMatch(String(matchInfo[0].toornament_match_id));
-    } else {
-      const candidates: ToornamentMatch[] = await toornament.listMatches(tournamentId, {
+/** Finds the Toornament match of an internal match and which opponent is which team. */
+async function resolveMatch(
+  toornament: Toornament,
+  tournamentId: string,
+  matchKey: string,
+  linkedMatchId: string | null,
+  team1Participant: string,
+  team2Participant: string
+): Promise<ResolvedMatch | null> {
+  const cached = resolvedMatches.get(matchKey);
+  if (cached) return cached;
+  let target: ToornamentMatch | undefined;
+  if (linkedMatchId) {
+    // Matches created from the season page are linked explicitly.
+    target = await toornament.getMatch(linkedMatchId);
+  } else {
+    target = (
+      await toornament.listMatches(tournamentId, {
         statuses: ["pending", "running"],
         participantIds: [team1Participant, team2Participant]
-      });
-      target = toornamentMatchId
-        ? candidates.find((match) => match.id === toornamentMatchId) ?? candidates[0]
-        : candidates[0];
-    }
-    if (!target) {
-      console.warn(
-        `No open Toornament match between ${team1Participant} and ${team2Participant} in tournament ${tournamentId}.`
-      );
-      return;
-    }
-    toornamentMatchId = target.id;
-    matchIdCache.set(cacheKey, toornamentMatchId);
-    // Admins may create the match with teams swapped; map sides by participant.
-    const opponents = target.opponents ?? [];
-    const numberOf = (participantId: string): number | undefined =>
-      opponents.find((opp) => String(opp.participant?.id ?? "") === participantId)?.number;
-    const sides = { team1: numberOf(team1Participant), team2: numberOf(team2Participant) };
-    if (!sides.team1 || !sides.team2) return;
-
-    const maps: RowDataPacket[] = await db.query(
-      "SELECT map_number, map_name, team1_score, team2_score, winner FROM map_stats WHERE match_id = ? ORDER BY map_number ASC",
-      [match_id]
-    );
-    const resultFor = (winnerTeamId: number | null, teamId: number): ToornamentResult => {
-      if (!winnerTeamId) return null;
-      return winnerTeamId == teamId ? "win" : "loss";
-    };
-
-    let team1Wins: number = 0;
-    let team2Wins: number = 0;
-    for (const map of maps) {
-      if (map.winner == team1_id) team1Wins++;
-      else if (map.winner == team2_id) team2Wins++;
-      try {
-        await toornament.updateGame(
-          toornamentMatchId,
-          map.map_number + 1,
-          [
-            { number: sides.team1, score: map.team1_score, result: resultFor(map.winner, team1_id) },
-            { number: sides.team2, score: map.team2_score, result: resultFor(map.winner, team2_id) }
-          ],
-          map.map_name
-        );
-      } catch (err) {
-        // A match configured with fewer games than played maps must not block the match score.
-        console.error(`Failed to update Toornament game ${map.map_number + 1}: ${err}`);
-      }
-    }
-
-    // A BO1 reports its round score, a series the number of maps won.
-    const singleMap: boolean = max_maps == 1 && maps.length > 0;
-    const team1Score: number = singleMap ? maps[0].team1_score : team1Wins;
-    const team2Score: number = singleMap ? maps[0].team2_score : team2Wins;
-    const team1Update: ToornamentOpponentUpdate = { number: sides.team1, score: team1Score };
-    const team2Update: ToornamentOpponentUpdate = { number: sides.team2, score: team2Score };
-    if (event === "series_end") {
-      if (winner === "team1") {
-        team1Update.result = "win";
-        team2Update.result = "loss";
-      } else if (winner === "team2") {
-        team1Update.result = "loss";
-        team2Update.result = "win";
-      } else {
-        team1Update.result = "draw";
-        team2Update.result = "draw";
-      }
-    }
-    await toornament.updateMatch(toornamentMatchId, [team1Update, team2Update]);
-
-    if (event !== "series_end") return;
-    matchIdCache.delete(cacheKey);
-    const remaining: ToornamentMatch[] = await toornament.listMatches(tournamentId, {
-      statuses: ["pending", "running"]
-    });
-    if (remaining.length) return;
-    await db.query("UPDATE season SET end_date = ? WHERE id = ?", [
-      new Date().toISOString().slice(0, 19).replace("T", " "),
-      seasonInfo[0].id
-    ]);
-    GlobalEmitter.emit("seasonUpdate");
-  } catch (err) {
-    // Never let a bracket update take down the match flow that triggered it.
-    console.error(`Failed to update Toornament match for season ${season_id}: ${err}`);
+      })
+    )[0];
   }
+  if (!target) {
+    console.warn(
+      `No open Toornament match between ${team1Participant} and ${team2Participant} in tournament ${tournamentId}.`
+    );
+    return null;
+  }
+  // Admins may create the match with teams swapped; map sides by participant.
+  const opponents = target.opponents ?? [];
+  const numberOf = (participantId: string): number | undefined =>
+    opponents.find((opp) => String(opp.participant?.id ?? "") === participantId)?.number;
+  const team1 = numberOf(team1Participant);
+  const team2 = numberOf(team2Participant);
+  if (!team1 || !team2) return null;
+  const resolved: ResolvedMatch = { toornamentMatchId: target.id, sides: { team1, team2 } };
+  resolvedMatches.set(matchKey, resolved);
+  return resolved;
+}
+
+async function reportToornamentMatch(
+  event: TournamentEvent,
+  match_id: number | string,
+  season_id: number,
+  winner: string | null
+): Promise<void> {
+  const seasonInfo: RowDataPacket[] = await db.query(
+    "SELECT id, user_id, toornament_id FROM season WHERE id = ? AND is_toornament = 1",
+    [season_id]
+  );
+  if (!seasonInfo[0]?.toornament_id) return;
+  const tournamentId: string = seasonInfo[0].toornament_id;
+
+  const matchInfo: RowDataPacket[] = await db.query(
+    "SELECT team1_id, team2_id, max_maps, toornament_match_id, end_time, cancelled FROM `match` WHERE id = ?",
+    [match_id]
+  );
+  if (!matchInfo[0]) return;
+  const { team1_id, team2_id } = matchInfo[0];
+  const maxMaps: number = Number(matchInfo[0].max_maps) || 1;
+  // A late round event must not reopen a match whose result was already sent.
+  if (event !== "series_end" && (matchInfo[0].end_time || matchInfo[0].cancelled)) return;
+
+  const teams: RowDataPacket[] = await db.query(
+    "SELECT id, toornament_team_id FROM team WHERE id IN (?, ?)",
+    [team1_id, team2_id]
+  );
+  const participantOf = (teamId: number): string | null => {
+    const row = teams.find((team) => team.id == teamId);
+    return row?.toornament_team_id ? String(row.toornament_team_id) : null;
+  };
+  const team1Participant: string | null = participantOf(team1_id);
+  const team2Participant: string | null = participantOf(team2_id);
+  if (!team1Participant || !team2Participant) return;
+
+  const toornament: Toornament = await Toornament.forUser(seasonInfo[0].user_id);
+  const matchKey: string = String(match_id);
+  const resolved = await resolveMatch(
+    toornament,
+    tournamentId,
+    matchKey,
+    matchInfo[0].toornament_match_id ? String(matchInfo[0].toornament_match_id) : null,
+    team1Participant,
+    team2Participant
+  );
+  if (!resolved) return;
+  const { toornamentMatchId, sides } = resolved;
+
+  const maps: RowDataPacket[] = await db.query(
+    "SELECT map_number, map_name, team1_score, team2_score, winner, end_time FROM map_stats WHERE match_id = ? ORDER BY map_number ASC",
+    [match_id]
+  );
+  const planned: string[] = await getPlannedMaps(match_id, maxMaps);
+  const resultFor = (
+    winnerTeamId: number | null,
+    teamId: number,
+    finished: boolean
+  ): ToornamentResult => {
+    // A map that ended with no winner is a draw (e.g. a BO1 tie).
+    if (!winnerTeamId) return finished ? "draw" : null;
+    return winnerTeamId == teamId ? "win" : "loss";
+  };
+
+  let team1Wins: number = 0;
+  let team2Wins: number = 0;
+  const played: Set<number> = new Set();
+  for (const map of maps) {
+    played.add(map.map_number);
+    if (map.winner == team1_id) team1Wins++;
+    else if (map.winner == team2_id) team2Wins++;
+    const finished: boolean = map.winner != null || map.end_time != null || event === "series_end";
+    const opponents: ToornamentOpponentUpdate[] = [
+      { number: sides.team1, score: map.team1_score ?? 0, result: resultFor(map.winner, team1_id, finished) },
+      { number: sides.team2, score: map.team2_score ?? 0, result: resultFor(map.winner, team2_id, finished) }
+    ];
+    const mapName: string | null = map.map_name || planned[map.map_number] || null;
+    const status = finished ? "completed" : "running";
+    try {
+      await sendOnce(
+        `${toornamentMatchId}:game:${map.map_number + 1}`,
+        { opponents, mapName, status },
+        () => toornament.updateGame(toornamentMatchId, map.map_number + 1, opponents, mapName, status)
+      );
+    } catch (err) {
+      // A match configured with fewer games than played maps must not block the match score.
+      console.error(`Failed to update Toornament game ${map.map_number + 1}: ${err}`);
+    }
+  }
+
+  // Games not played yet only get their map, as soon as it is known.
+  for (let index = 0; index < planned.length; index++) {
+    if (played.has(index) || !planned[index]) continue;
+    try {
+      await sendOnce(
+        `${toornamentMatchId}:game:${index + 1}`,
+        { mapName: planned[index] },
+        () => toornament.updateGame(toornamentMatchId, index + 1, null, planned[index])
+      );
+    } catch (err) {
+      console.error(`Failed to set the map of Toornament game ${index + 1}: ${err}`);
+    }
+  }
+
+  if (!maps.length && event !== "series_end") return;
+
+  // A BO1 reports its round score, a series the number of maps won.
+  const singleMap: boolean = maxMaps == 1 && maps.length > 0;
+  const team1Score: number = singleMap ? maps[0].team1_score ?? 0 : team1Wins;
+  const team2Score: number = singleMap ? maps[0].team2_score ?? 0 : team2Wins;
+  const team1Update: ToornamentOpponentUpdate = { number: sides.team1, score: team1Score };
+  const team2Update: ToornamentOpponentUpdate = { number: sides.team2, score: team2Score };
+  if (event === "series_end") {
+    if (winner === "team1") {
+      team1Update.result = "win";
+      team2Update.result = "loss";
+    } else if (winner === "team2") {
+      team1Update.result = "loss";
+      team2Update.result = "win";
+    } else {
+      team1Update.result = "draw";
+      team2Update.result = "draw";
+    }
+  }
+  await sendOnce(`${toornamentMatchId}:match`, [team1Update, team2Update], () =>
+    toornament.updateMatch(toornamentMatchId, [team1Update, team2Update])
+  );
+
+  if (event !== "series_end") return;
+  resolvedMatches.delete(matchKey);
+  for (const sentKey of [...sentPayloads.keys()]) {
+    if (sentKey.startsWith(`${toornamentMatchId}:`)) sentPayloads.delete(sentKey);
+  }
+  const remaining: ToornamentMatch[] = await toornament.listMatches(tournamentId, {
+    statuses: ["pending", "running"]
+  });
+  if (remaining.length) return;
+  await db.query("UPDATE season SET end_date = ? WHERE id = ?", [
+    new Date().toISOString().slice(0, 19).replace("T", " "),
+    seasonInfo[0].id
+  ]);
+  GlobalEmitter.emit("seasonUpdate");
 }
 
 /** Imports Toornament participants as teams (names only, no roster).

@@ -10,7 +10,8 @@ import GlobalEmitter from "../utility/emitter.js";
 import { RowDataPacket } from "mysql2";
 import { Response } from "express";
 import Utils from "../utility/utils.js";
-import update_tournament_match from "../services/tournament.js";
+import update_tournament_match, { report_tournament_maps } from "../services/tournament.js";
+import { finishMatch, matchWentLive, updateLiveMatch } from "../services/discord.js";
 
 class SeriesFlowService {
   static async OnSeriesResult(event: Get5_OnSeriesResult, res: Response) {
@@ -36,7 +37,9 @@ class SeriesFlowService {
         event.winner?.team === "none" &&
         matchInfo[0].max_maps != 2 &&
         event.team1_series_score == 0 &&
-        event.team2_series_score == 0
+        event.team2_series_score == 0 &&
+        // Every map drawn (e.g. a BO1 ending in a tie) is a result, not a cancel.
+        !(await Utils.hasPlayedMap(event.matchid))
       ) {
         winnerId = null;
         cancelled = 1;
@@ -91,6 +94,7 @@ class SeriesFlowService {
       }
 
       // Check if a match has a season ID and we're not cancelled.
+      finishMatch(event.matchid);
       if (matchInfo[0].season_id && !cancelled) {
         await update_tournament_match(
           "series_end",
@@ -171,6 +175,7 @@ class SeriesFlowService {
         );
       }
 
+      updateLiveMatch(event.matchid);
       if (matchInfo[0].season_id) {
         await update_tournament_match(
           "map_end",
@@ -284,6 +289,7 @@ class SeriesFlowService {
       sqlString = "INSERT INTO veto_side SET ?";
       await db.query(sqlString, [insertObj]);
       GlobalEmitter.emit("vetoSideUpdate");
+      matchWentLive(event.matchid);
       return res.status(200).send({ message: "Success" });
     } catch (error: unknown) {
       console.error(error);
@@ -355,6 +361,9 @@ class SeriesFlowService {
     sqlString = "INSERT INTO veto SET ?";
     await db.query(sqlString, [insertObj]);
     GlobalEmitter.emit("vetoUpdate");
+    // The veto started: the match is launched, and its maps may now be known.
+    matchWentLive(matchid);
+    report_tournament_maps(matchid);
   }
 }
 

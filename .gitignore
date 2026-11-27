@@ -48,3 +48,7 @@ build/Release
 .env.test
 
 .vscode/
+
+# Runtime data written by the API (match backups, demos).
+public/backups/
+public/demos/

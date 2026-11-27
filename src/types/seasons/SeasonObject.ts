@@ -10,4 +10,7 @@ export interface SeasonObject {
     is_toornament?: boolean | null;
     toornament_id?: string | null;
     toornament_logo?: string | null;
+    discord_webhook_url?: string | null;
+    discord_live_webhook_url?: string | null;
+    discord_results_webhook_url?: string | null;
 }

@@ -26,6 +26,16 @@ import {
   getSeasonMatchGames,
   prepareSeasonMatch
 } from "../services/toornamentSeason.js";
+import {
+  CHANNELS,
+  CHANNEL_COLUMNS,
+  DiscordChannel,
+  DiscordError,
+  describeWebhook,
+  isDiscordChannel,
+  normalizeWebhookUrl,
+  sendTestMessage
+} from "../services/discord.js";
 import { ResultSetHeader, RowDataPacket } from "mysql2";
 import { SeasonObject } from "../types/seasons/SeasonObject.js";
 import { SeasonCvarObject } from "../types/seasons/SeasonCvarObject.js";
@@ -349,7 +359,14 @@ router.get("/:season_id", async (req, res, next) => {
       res.status(404).json({ message: "Season not found." });
       return;
     }
-    const season: string = JSON.parse(JSON.stringify(seasons[0]));
+    const season: any = JSON.parse(JSON.stringify(seasons[0]));
+    // Webhook URLs are secrets: anyone holding one can post in its channel.
+    season.discord_webhook_set = Boolean(season.discord_webhook_url);
+    season.discord_live_webhook_set = Boolean(season.discord_live_webhook_url);
+    season.discord_results_webhook_set = Boolean(season.discord_results_webhook_url);
+    delete season.discord_webhook_url;
+    delete season.discord_live_webhook_url;
+    delete season.discord_results_webhook_url;
     res.json({ matches, season });
   } catch (err) {
     console.error(err);
@@ -923,5 +940,195 @@ router.post(
     }
   }
 );
+
+/** Loads a season the requester may configure (owner, admin or super admin). */
+const getManagedSeason = async (req: any, res: any): Promise<RowDataPacket | null> => {
+  const rows: RowDataPacket[] = await db.query(
+    "SELECT id, user_id, name, discord_webhook_url, discord_live_webhook_url, discord_results_webhook_url FROM season WHERE id = ?",
+    [parseInt(req.params.season_id)]
+  );
+  if (!rows[0]) {
+    res.status(404).json({ message: "Season not found." });
+    return null;
+  }
+  if (rows[0].user_id != req.user?.id && !Utils.adminCheck(req.user)) {
+    res.status(403).json({ message: "User is not authorized to perform action." });
+    return null;
+  }
+  return rows[0];
+};
+
+const sendDiscordError = (res: any, err: unknown) => {
+  if (err instanceof DiscordError) {
+    res.status(err.status >= 500 ? 502 : 400).json({ message: err.message });
+    return;
+  }
+  console.error(err);
+  res.status(500).json({ message: (err as Error).toString() });
+};
+
+/** Reads the target channel of a request (`launch` when omitted). */
+const getChannel = (req: any, res: any): DiscordChannel | null => {
+  const body = (Array.isArray(req.body) ? req.body[0] : req.body) ?? {};
+  const channel = body.channel ?? req.query.channel ?? "launch";
+  if (!isDiscordChannel(channel)) {
+    res.status(400).json({ message: `channel must be one of: ${CHANNELS.join(", ")}.` });
+    return null;
+  }
+  return channel;
+};
+
+/**
+ * @swagger
+ *
+ * /seasons/{season_id}/discord:
+ *   get:
+ *     description: Discord settings of a season, per channel (launch, live, results). Webhook URLs are never returned.
+ *     produces:
+ *       - application/json
+ *     parameters:
+ *       - name: season_id
+ *         required: true
+ *         schema:
+ *          type: integer
+ *     tags:
+ *       - seasons
+ *     responses:
+ *       200:
+ *         description: For each channel, whether a webhook is set, and its name and channel if it is reachable.
+ *       403:
+ *         $ref: '#/components/responses/Unauthorized'
+ *   put:
+ *     description: Sets the Discord webhook of a channel of the season. launch receives the matches to launch, live the matches in progress (updated on every score), results the final scores. An empty value removes it.
+ *     produces:
+ *       - application/json
+ *     parameters:
+ *       - name: season_id
+ *         required: true
+ *         schema:
+ *          type: integer
+ *     requestBody:
+ *      required: true
+ *      content:
+ *        application/json:
+ *          schema:
+ *            type: object
+ *            properties:
+ *              channel:
+ *                type: string
+ *                enum: [launch, live, results]
+ *                default: launch
+ *              webhook_url:
+ *                type: string
+ *     tags:
+ *       - seasons
+ *     responses:
+ *       200:
+ *         $ref: '#/components/responses/Success'
+ *       400:
+ *         $ref: '#/components/responses/BadRequest'
+ *       403:
+ *         $ref: '#/components/responses/Unauthorized'
+ */
+router.get("/:season_id/discord", Utils.ensureAuthenticated, async (req, res) => {
+  try {
+    const season = await getManagedSeason(req, res);
+    if (!season) return;
+    const result: Record<string, any> = {};
+    await Promise.all(
+      CHANNELS.map(async (channel) => {
+        const encrypted = season[CHANNEL_COLUMNS[channel]];
+        if (!encrypted) {
+          result[channel] = { webhook_set: false };
+          return;
+        }
+        try {
+          const info = await describeWebhook(Utils.decrypt(encrypted)!);
+          result[channel] = { webhook_set: true, reachable: true, ...info };
+        } catch (err) {
+          result[channel] = { webhook_set: true, reachable: false, message: (err as Error).message };
+        }
+      })
+    );
+    res.json(result);
+  } catch (err) {
+    sendDiscordError(res, err);
+  }
+});
+
+router.put("/:season_id/discord", Utils.ensureAuthenticated, async (req, res) => {
+  try {
+    const season = await getManagedSeason(req, res);
+    if (!season) return;
+    const channel = getChannel(req, res);
+    if (!channel) return;
+    const column: string = CHANNEL_COLUMNS[channel];
+    const body = (Array.isArray(req.body) ? req.body[0] : req.body) ?? {};
+    const raw: string = body.webhook_url == null ? "" : String(body.webhook_url).trim();
+    if (!raw) {
+      await db.query(`UPDATE season SET ${column} = NULL WHERE id = ?`, [season.id]);
+      res.json({ message: "Discord channel removed from the season." });
+      return;
+    }
+    const webhookUrl: string = normalizeWebhookUrl(raw);
+    const info = await describeWebhook(webhookUrl);
+    await db.query(`UPDATE season SET ${column} = ? WHERE id = ?`, [
+      Utils.encrypt(webhookUrl),
+      season.id
+    ]);
+    res.json({ message: "Discord channel saved.", ...info });
+  } catch (err) {
+    sendDiscordError(res, err);
+  }
+});
+
+/**
+ * @swagger
+ *
+ * /seasons/{season_id}/discord/test:
+ *   post:
+ *     description: Posts a test message in a Discord channel of the season (deleted after 30 seconds).
+ *     produces:
+ *       - application/json
+ *     parameters:
+ *       - name: season_id
+ *         required: true
+ *         schema:
+ *          type: integer
+ *     requestBody:
+ *      content:
+ *        application/json:
+ *          schema:
+ *            type: object
+ *            properties:
+ *              channel:
+ *                type: string
+ *                enum: [launch, live, results]
+ *                default: launch
+ *     tags:
+ *       - seasons
+ *     responses:
+ *       200:
+ *         $ref: '#/components/responses/Success'
+ *       400:
+ *         $ref: '#/components/responses/BadRequest'
+ */
+router.post("/:season_id/discord/test", Utils.ensureAuthenticated, async (req, res) => {
+  try {
+    const season = await getManagedSeason(req, res);
+    if (!season) return;
+    const channel = getChannel(req, res);
+    if (!channel) return;
+    const encrypted = season[CHANNEL_COLUMNS[channel]];
+    if (!encrypted) {
+      res.status(400).json({ message: "No Discord channel is set for this season." });
+      return;
+    }
+    await sendTestMessage(Utils.decrypt(encrypted)!, season.name, channel);
+    res.json({ message: "Test message sent to Discord." });
+  } catch (err) {
+    sendDiscordError(res, err);
+  }
+});
 
 export default router;

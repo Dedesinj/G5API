@@ -433,6 +433,21 @@ static async getRatingFromSteamId(steamId: string): Promise<number | null> {
    * @param {String|Number} matchid - The ID of a match
    * @returns An object containing the HTTP error, followed by a message.
    */
+  /** Whether at least one map of a match was actually played.
+   *
+   * get5 ends a series with no winner and a 0-0 series score both when the
+   * match was stopped before anything was played and when every map ended in
+   * a draw; only the map stats tell them apart.
+   * @param {string | number} matchid - The internal match ID.
+   */
+  static async hasPlayedMap(matchid: string | number): Promise<boolean> {
+    const rows: RowDataPacket[] = await db.query(
+      "SELECT 1 FROM map_stats WHERE match_id = ? AND (end_time IS NOT NULL OR team1_score > 0 OR team2_score > 0) LIMIT 1",
+      [matchid]
+    );
+    return rows.length > 0;
+  }
+
   static async checkIfMatchExists(matchid: string | number): Promise<AccessMessage | null> {
     try {
       if (matchid == null) {

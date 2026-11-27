@@ -9,6 +9,7 @@ const router = Router();
 
 import { db } from "../../services/db.js";
 import { releaseManagedServer } from "../../services/dathost.js";
+import { finishMatch } from "../../services/discord.js";
 import Utils from "../../utility/utils.js";
 
 import GameServer from "../../utility/serverrcon.js";
@@ -150,6 +151,7 @@ router.get(
           }
         }
         await releaseManagedServer(matchRow[0].server_id);
+        await finishMatch(req.params.match_id);
         GlobalEmitter.emit("matchUpdate");
         res.json({ message: "Match has been forfeitted successfully." });
         return;
@@ -274,6 +276,7 @@ router.get(
           }
         }
         await releaseManagedServer(matchRow[0].server_id);
+        await finishMatch(req.params.match_id);
         GlobalEmitter.emit("matchUpdate");
         res.json({ message: "Match has been cancelled successfully." });
         return;
@@ -1029,7 +1032,11 @@ router.get(
         let serverUpdate: GameServer = await getGameServer(req.params.match_id);
         try {
           let rconResponse: string = await serverUpdate.getBackups();
-          res.json({ message: "Backups retrieved.", response: rconResponse });
+          res.json({
+            message: "Backups retrieved.",
+            response: rconResponse,
+            backups: GameServer.parseBackupList(rconResponse)
+          });
         } catch (err) {
           res
             .status(500)
@@ -1109,6 +1116,10 @@ router.post(
           res
             .status(412)
             .json({ message: "Please provide the backup name." });
+          return;
+        }
+        if (!GameServer.parseBackupName(req.body[0].backup_name)) {
+          res.status(412).json({ message: "Invalid backup name." });
           return;
         }
         try {
