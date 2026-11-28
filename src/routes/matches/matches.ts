@@ -45,6 +45,28 @@ import { report_tournament_maps } from "../../services/tournament.js";
 type MatchGame = "cs2" | "csgo";
 const DEFAULT_MATCH_GAME: MatchGame = "cs2";
 
+// Who chooses which team starts the in-game veto: team1, team2, or "random" for a
+// Rock-Paper-Scissors game between the two captains (MatchZy veto_choice "rps").
+const VETO_FIRST_VALUES: string[] = ["team1", "team2", "random"];
+
+/** Returns the stored veto_first, null when not given, or throws for an unknown value. */
+function normalizeVetoFirst(value: unknown): string | null {
+  if (value == null || value === "") return null;
+  const normalized: string = String(value).trim().toLowerCase();
+  if (normalized === "rps") return "random";
+  if (!VETO_FIRST_VALUES.includes(normalized)) {
+    throw new Error(`Invalid veto_first value. Expected one of: ${VETO_FIRST_VALUES.join(", ")}.`);
+  }
+  return normalized;
+}
+
+/** MatchZy veto_choice sent in the match config for a stored veto_first. */
+function vetoChoiceOf(vetoFirst: string | null | undefined): string {
+  if (vetoFirst === "team2") return "team2";
+  if (vetoFirst === "random") return "rps";
+  return "team1";
+}
+
 function normalizeMatchGame(game: unknown): MatchGame {
   if (game == null || game === "") {
     return DEFAULT_MATCH_GAME;
@@ -106,7 +128,7 @@ function normalizeMatchGame(game: unknown): MatchGame {
  *           description: Boolean value representing whether to skip the veto or not.
  *         veto_first:
  *           type: string
- *           description: The string value team1 or team2 on who gets to veto first.
+ *           description: Which team chooses who starts the in-game veto, team1, team2 or random (Rock-Paper-Scissors between the captains). Sent to MatchZy as veto_choice; standard Get5/MatchZy use it as the team that starts the veto.
  *         veto_mappool:
  *           type: string
  *           description: The map pool given by the system. Space separated.
@@ -1095,7 +1117,7 @@ router.get("/:match_id/config", async (req, res, next) => {
       matchid: matchID,
       match_title: matchInfo[0].title,
       side_type: matchInfo[0].side_type,
-      veto_first: matchInfo[0].veto_first,
+      veto_first: matchInfo[0].veto_first || "team1",
       skip_veto: matchInfo[0].skip_veto == 0 ? false : true,
       min_players_to_ready:
         matchInfo[0].min_player_ready !== null
@@ -1153,6 +1175,9 @@ router.get("/:match_id/config", async (req, res, next) => {
       wingman: matchInfo[0]?.wingman == 1 ? true : false,
     };
     matchJSON.num_maps = parseInt(matchInfo[0].max_maps);
+    // MatchZy (HelloNexen fork): that team, or the Rock-Paper-Scissors winner, chooses with .vetostart / .vetoswap
+    // who starts the veto. Other Get5/MatchZy servers ignore it and use veto_first.
+    if (!matchJSON.skip_veto) matchJSON.veto_choice = vetoChoiceOf(matchInfo[0].veto_first);
     if (matchJSON.skip_veto && matchInfo[0].map_sides)
       matchJSON.map_sides = matchInfo[0].map_sides.split(",");
     sql = "SELECT * FROM team WHERE id = ?";
@@ -1219,8 +1244,10 @@ router.get("/:match_id/config", async (req, res, next) => {
 router.post("/", Utils.ensureAuthenticated, async (req, res, next) => {
   try {
     let game: MatchGame;
+    let vetoFirst: string;
     try {
       game = normalizeMatchGame(req.body[0].game);
+      vetoFirst = normalizeVetoFirst(req.body[0].veto_first) ?? "team1";
     } catch (err) {
       res.status(400).json({ message: (err as Error).message });
       return;
@@ -1344,7 +1371,7 @@ router.post("/", Utils.ensureAuthenticated, async (req, res, next) => {
       max_maps: req.body[0].max_maps,
       title: req.body[0].title,
       skip_veto: skipVeto,
-      veto_first: req.body[0].veto_first,
+      veto_first: vetoFirst,
       veto_mappool: req.body[0].veto_mappool,
       side_type:
         req.body[0].side_type == null ? "standard" : req.body[0].side_type,
@@ -1495,13 +1522,13 @@ router.post("/", Utils.ensureAuthenticated, async (req, res, next) => {
 router.put("/", Utils.ensureAuthenticated, async (req, res, next) => {
   try {
     let game: MatchGame | undefined = undefined;
-    if (req.body[0].game !== undefined) {
-      try {
-        game = normalizeMatchGame(req.body[0].game);
-      } catch (err) {
-        res.status(400).json({ message: (err as Error).message });
-        return;
-      }
+    let vetoFirst: string | null = null;
+    try {
+      if (req.body[0].game !== undefined) game = normalizeMatchGame(req.body[0].game);
+      vetoFirst = normalizeVetoFirst(req.body[0].veto_first);
+    } catch (err) {
+      res.status(400).json({ message: (err as Error).message });
+      return;
     }
 
     let diffServer: boolean = false;
@@ -1580,7 +1607,7 @@ router.put("/", Utils.ensureAuthenticated, async (req, res, next) => {
         private_match: req.body[0].private_match,
         max_maps: maxMaps,
         skip_veto: vetoMapPool == null ? null : 1,
-        veto_first: req.body[0].veto_first,
+        veto_first: vetoFirst ?? undefined,
         veto_mappool:
           vetoMapPool == null ? req.body[0].veto_mappool : vetoMapPool,
         side_type: req.body[0].side_type,

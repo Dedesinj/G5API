@@ -3,6 +3,7 @@ export interface MatchJSON {
     match_title: string,
     side_type: string,
     veto_first: string,
+    veto_choice?: string,
     skip_veto: boolean,
     min_players_to_ready: number
     players_per_team: number,
