@@ -288,6 +288,9 @@ export async function prepareSeasonMatch(
   take("maps_to_win");
   const spectators: string | undefined = take("spectators");
   const mapSides: string | undefined = take("map_sides");
+  // Season default for who chooses which team starts the in-game veto.
+  const seasonVetoFirst: string = (take("veto_first") ?? "").toLowerCase();
+  const vetoFirst: string = ["team1", "team2", "random"].includes(seasonVetoFirst) ? seasonVetoFirst : "team1";
 
   return {
     server_id: null,
@@ -308,7 +311,7 @@ export async function prepareSeasonMatch(
     min_spectators_to_ready: toInt(take("min_spectators_to_ready"), 0),
     spectator_auths: spectators ? spectators.trim().split(" ") : null,
     map_sides: mapSides ? mapSides.trim().split(" ").join(",") : null,
-    veto_first: "team1",
+    veto_first: vetoFirst,
     match_cvars: cvars,
     game: "cs2"
   };

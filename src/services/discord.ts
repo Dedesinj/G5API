@@ -147,6 +147,7 @@ interface MatchRow extends RowDataPacket {
   title: string | null;
   max_maps: number | null;
   skip_veto: number | null;
+  veto_first: string | null;
   veto_mappool: string | null;
   team1_id: number;
   team2_id: number;
@@ -169,7 +170,7 @@ interface MatchRow extends RowDataPacket {
 
 async function loadMatch(matchId: number | string): Promise<MatchRow | null> {
   const rows = (await db.query(
-    "SELECT m.id, m.title, m.max_maps, m.skip_veto, m.veto_mappool, m.team1_id, m.team2_id, " +
+    "SELECT m.id, m.title, m.max_maps, m.skip_veto, m.veto_first, m.veto_mappool, m.team1_id, m.team2_id, " +
       "m.team1_string, m.team2_string, m.team1_score, m.team2_score, m.winner, m.cancelled, m.forfeit, " +
       "m.end_time, m.season_id, m.discord_message_id, m.discord_live_message_id, m.discord_result_message_id, " +
       "s.name AS season_name, g.ip_string, g.port " +
@@ -249,7 +250,14 @@ function buildLaunchMessage(match: MatchRow): object {
     const maps: string[] = String(match.veto_mappool).split(" ").filter(Boolean);
     fields.push({ name: "Maps", value: maps.slice(0, match.max_maps || 1).join(", "), inline: true });
   } else {
-    fields.push({ name: "Veto", value: "In game", inline: true });
+    // Who chooses which team starts the veto (MatchZy veto_choice).
+    const chooser: string =
+      match.veto_first === "random"
+        ? "Rock-Paper-Scissors winner"
+        : match.veto_first === "team2"
+        ? team2
+        : team1;
+    fields.push({ name: "Veto", value: `In game · ${chooser} chooses who starts`, inline: true });
   }
   fields.push({
     name: "Server",
